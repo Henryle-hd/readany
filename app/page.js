@@ -8,6 +8,7 @@ const LS = {
   set(k, v) { try { localStorage.setItem('readany:' + k, JSON.stringify(v)) } catch {} },
 }
 const pitchHz = p => { const hz = Math.round((p - 1) * 50); return (hz >= 0 ? '+' : '') + hz + 'Hz' }
+const SPEAKABLE = /[\p{L}\p{N}]/u
 const hasHL = () => typeof CSS !== 'undefined' && 'highlights' in CSS
 const fmtTime = s => {
   s = Math.max(0, Math.round(s))
@@ -164,13 +165,14 @@ export default function Home() {
       E.endAt = null; setEndAt(null); clearWord()
       return
     }
-    E.idx = i; E.offset = offset; E.playing = true
+    if (i !== E.idx) E.retries = 0
+    E.idx = i; E.offset = offset; E.playing = true; E.startedAt = Date.now()
     setPlaying(true); setCur(i)
     const S = settingsRef.current
     if (S.engine === 'edge') return speakEdge(i, token)
     if (!synth) return
     const text = F.sents[i].t.slice(offset)
-    if (!text.trim()) return speakAt(i + 1)
+    if (!SPEAKABLE.test(text)) return speakAt(i + 1) // symbols only: speech engines go silent and never fire onend
     const u = new SpeechSynthesisUtterance(text)
     const v = voicesRef.current.find(v => v.voiceURI === S.voice)
     if (v) { u.voice = v; u.lang = v.lang }
@@ -222,17 +224,20 @@ export default function Home() {
   function speakEdge(i, token) {
     const E = eng.current, F = flatRef.current, a = audioRef.current
     const text = F.sents[i].t
-    if (!text.trim()) return speakAt(i + 1)
+    if (!SPEAKABLE.test(text)) return speakAt(i + 1)
     E.edgeIdx = i
+    E.waiting = true
     setBuffering(true)
     edgeFetch(text).then(({ url, words }) => {
       if (token !== E.token) return
+      E.waiting = false; E.startedAt = Date.now()
       setBuffering(false)
       a.src = url
       E.words = words
       playEdge(token, i)
     }).catch(err => {
       if (token !== E.token) return
+      E.waiting = false
       setBuffering(false); pause(); setError('Edge voice failed: ' + err.message)
     })
     // prefetch the next sentences so playback is gapless
@@ -381,6 +386,27 @@ export default function Home() {
     setFollow(false)
     el?.scrollIntoView({ block: 'center', behavior: 'smooth' })
   }
+
+  // watchdog: if speech silently dies (no onend), retry the sentence once, then move on
+  useEffect(() => {
+    const t = setInterval(() => {
+      const E = eng.current
+      if (!E.playing || E.waiting || Date.now() - (E.startedAt || 0) < 2500) return
+      let stalled
+      if (settingsRef.current.engine === 'edge') {
+        const a = audioRef.current
+        stalled = a && a.paused && !a.ended
+      } else {
+        const s = window.speechSynthesis
+        stalled = s && !s.speaking && !s.pending
+      }
+      if (!stalled) return
+      E.startedAt = Date.now()
+      if ((E.retries = (E.retries || 0) + 1) <= 1) speakAt(E.idx, E.offset)
+      else speakAt(E.idx + 1)
+    }, 1000)
+    return () => clearInterval(t)
+  }, [])
 
   // sleep timer
   useEffect(() => {
